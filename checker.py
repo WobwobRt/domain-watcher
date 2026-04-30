@@ -5,9 +5,9 @@ import subprocess
 import hashlib
 import smtplib
 import logging
+import datetime
 import time
 import re
-from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
@@ -59,32 +59,101 @@ def whois(domain: str) -> str:
 
 
 def parse_status(raw: str) -> dict:
-    """Extract key fields from whois output."""
-    fields = {}
+    """
+    Parse whois output into structured fields.
 
-    patterns = {
-        "status": r"(?:Status|Domain Status)\s*:\s*(.+)",
-        "registrar": r"Registrar\s*:\s*(.+)",
-        "created": r"(?:Creation Date|Created|registered)\s*:\s*(.+)",
-        "expires": r"(?:Registry Expiry Date|Expiry Date|expires)\s*:\s*(.+)",
-        "name_servers": r"Name Server\s*:\s*(.+)",
+    Handles the SIDN (.nl) format which uses indented multi-line blocks:
+
+        Domain name: example.nl
+        Status:      active
+        Registrar:
+           Hostnet B.V.
+           De Ruijterkade 6
+           ...
+        Abuse Contact:
+           +31.207500800
+           abuse@hostnet.nl
+        DNSSEC:      yes
+        Domain nameservers:
+           ns01.hostnet.nl
+           ns02.hostnet.nl
+        Creation Date: 1996-10-03
+        Updated Date:  2025-07-02
+        Record maintained by: SIDN BV
+
+    Also handles the flat key: value style used by most other TLDs.
+    """
+    lines = raw.splitlines()
+    fields: dict = {}
+
+    # --- detect availability first ---
+    raw_lower = raw.lower()
+    free_indicators = [
+        "no object found", "not found", "no match",
+        "available", "is free", "status: free",
+    ]
+    fields["registered"] = not any(ind in raw_lower for ind in free_indicators)
+
+    # --- single-value flat patterns (key: value on one line) ---
+    flat_patterns = {
+        "domain":          r"^Domain(?:\s+name)?\s*:\s*(.+)",
+        "status":          r"^(?:Status|Domain\s+Status)\s*:\s*(.+)",
+        "dnssec":          r"^DNSSEC\s*:\s*(.+)",
+        "created":         r"^(?:Creation\s+Date|Created\s+Date?|registered)\s*:\s*(.+)",
+        "updated":         r"^(?:Updated\s+Date?|Last\s+Modified)\s*:\s*(.+)",
+        "expires":         r"^(?:Registry\s+Expiry\s+Date|Expiry\s+Date|paid-till|expires)\s*:\s*(.+)",
+        "maintained_by":   r"^Record\s+maintained\s+by\s*:\s*(.+)",
+    }
+    for key, pattern in flat_patterns.items():
+        for line in lines:
+            m = re.match(pattern, line.strip(), re.IGNORECASE)
+            if m:
+                fields[key] = m.group(1).strip()
+                break
+
+    # --- multi-line indented blocks (SIDN style) ---
+    # A block starts with a header line ending in ":" (no value on same line),
+    # followed by indented continuation lines.
+    block_headers = {
+        "registrar":       r"^Registrar\s*:$",
+        "abuse_contact":   r"^Abuse\s+Contact\s*:$",
+        "name_servers":    r"^Domain\s+nameservers?\s*:$",
     }
 
-    for key, pattern in patterns.items():
-        matches = re.findall(pattern, raw, re.IGNORECASE)
-        if matches:
-            fields[key] = [m.strip() for m in matches] if len(matches) > 1 else matches[0].strip()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        for key, pattern in block_headers.items():
+            if re.match(pattern, line.strip(), re.IGNORECASE):
+                block = []
+                j = i + 1
+                while j < len(lines):
+                    next_line = lines[j]
+                    # Indented lines belong to the block
+                    if next_line.startswith("   ") or next_line.startswith("\t"):
+                        val = next_line.strip()
+                        if val:
+                            block.append(val)
+                        j += 1
+                    else:
+                        break
+                if block:
+                    fields[key] = block
+                i = j - 1
+                break
+        i += 1
 
-    # Detect if domain is free / not registered
-    free_indicators = [
-        "no object found",
-        "not found",
-        "no match",
-        "available",
-        "is free",
-    ]
-    raw_lower = raw.lower()
-    fields["registered"] = not any(ind in raw_lower for ind in free_indicators)
+    # --- fallback: flat name-server lines (non-SIDN TLDs) ---
+    if "name_servers" not in fields:
+        ns_matches = re.findall(r"^Name\s+Server\s*:\s*(.+)", raw, re.IGNORECASE | re.MULTILINE)
+        if ns_matches:
+            fields["name_servers"] = [ns.strip().lower() for ns in ns_matches]
+
+    # --- fallback: flat registrar line ---
+    if "registrar" not in fields:
+        m = re.search(r"^Registrar\s*:\s*(.+)", raw, re.IGNORECASE | re.MULTILINE)
+        if m:
+            fields["registrar"] = [m.group(1).strip()]
 
     return fields
 
@@ -108,18 +177,95 @@ def save_state(state: dict):
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
-def notify(domain: str, old: dict, new: dict):
-    subject = f"[domain-watcher] Change detected: {domain}"
-    body_lines = [
-        f"Domain: {domain}",
-        f"Checked at: {datetime.utcnow().isoformat()}Z",
-        "",
-        "=== Previous state ===",
-        json.dumps(old.get("parsed", {}), indent=2),
-        "",
-        "=== New state ===",
-        json.dumps(new, indent=2),
+def _fmt_field(value) -> str:
+    """Format a parsed field value for display."""
+    if isinstance(value, list):
+        return "\n".join(f"   {v}" for v in value)
+    return f"   {value}"
+
+
+def _fmt_parsed(parsed: dict) -> str:
+    """Render a parsed whois dict in a readable block."""
+    order = [
+        "domain", "status", "registered", "dnssec",
+        "registrar", "abuse_contact", "name_servers",
+        "created", "updated", "expires", "maintained_by",
     ]
+    labels = {
+        "domain":         "Domain name",
+        "status":         "Status",
+        "registered":     "Registered",
+        "dnssec":         "DNSSEC",
+        "registrar":      "Registrar",
+        "abuse_contact":  "Abuse Contact",
+        "name_servers":   "Name servers",
+        "created":        "Creation Date",
+        "updated":        "Updated Date",
+        "expires":        "Expiry Date",
+        "maintained_by":  "Maintained by",
+    }
+    lines = []
+    seen = set()
+    for key in order + [k for k in parsed if k not in order]:
+        if key not in parsed or key in seen:
+            continue
+        seen.add(key)
+        label = labels.get(key, key.replace("_", " ").title())
+        val = parsed[key]
+        if isinstance(val, list):
+            lines.append(f"{label}:")
+            for v in val:
+                lines.append(f"   {v}")
+        elif isinstance(val, bool):
+            lines.append(f"{label}:  {'yes' if val else 'no'}")
+        else:
+            lines.append(f"{label}:  {val}")
+    return "\n".join(lines)
+
+
+def _diff_summary(old: dict, new: dict) -> str:
+    """Summarise what actually changed between two parsed dicts."""
+    all_keys = set(old) | set(new)
+    changes = []
+    for key in sorted(all_keys):
+        o, n = old.get(key), new.get(key)
+        if o != n:
+            label = key.replace("_", " ").title()
+            o_str = ", ".join(o) if isinstance(o, list) else str(o)
+            n_str = ", ".join(n) if isinstance(n, list) else str(n)
+            changes.append(f"  {label}:\n    was: {o_str}\n    now: {n_str}")
+    return "\n".join(changes) if changes else "  (fingerprint changed but no field diff found)"
+
+
+def notify(domain: str, old: dict, new: dict):
+    first_seen = not old  # no previous state at all
+    subject = (
+        f"[domain-watcher] First check: {domain}"
+        if first_seen
+        else f"[domain-watcher] Change detected: {domain}"
+    )
+
+    old_parsed = old.get("parsed", {})
+    body_lines = [
+        f"Domain:     {domain}",
+        f"Checked at: {datetime.datetime.now(datetime.UTC).isoformat()}Z",
+        "",
+    ]
+
+    if first_seen:
+        body_lines += ["=== Initial state ===", _fmt_parsed(new)]
+    else:
+        body_lines += [
+            "=== What changed ===",
+            _diff_summary(old_parsed, new),
+            "",
+            "=== Previous state ===",
+            _fmt_parsed(old_parsed),
+            "",
+            "=== New state ===",
+            _fmt_parsed(new),
+        ]
+
     body = "\n".join(body_lines)
     log.info("CHANGE DETECTED for %s — sending notifications", domain)
 
@@ -193,12 +339,12 @@ def check_domain(domain: str, state: dict):
         state[domain] = {
             "fingerprint": fp,
             "parsed": parsed,
-            "last_changed": datetime.utcnow().isoformat() + "Z",
+            "last_changed": datetime.datetime.now(datetime.UTC).isoformat() + "Z",
         }
     else:
         log.info("No change for %s (status: %s)", domain, parsed.get("status", "?"))
 
-    state[domain]["last_checked"] = datetime.utcnow().isoformat() + "Z"
+    state[domain]["last_checked"] = datetime.datetime.now(datetime.UTC).isoformat() + "Z"
 
 
 def main():
