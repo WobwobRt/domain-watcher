@@ -5,9 +5,9 @@ import subprocess
 import hashlib
 import smtplib
 import logging
-import datetime
 import time
 import re
+import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
@@ -20,14 +20,14 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 STATE_FILE = Path("/data/state.json")
-DOMAINS = [d.strip() for d in os.environ.get("DOMAINS", "").split(",") if d.strip()]
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "3600"))
+DOMAINS = [d.strip() for d in os.environ.get("DOMAINS", "hensen.nl").split(",") if d.strip()]
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))
 
 # Notification config
 NOTIFY_WEBHOOK = os.environ.get("NOTIFY_WEBHOOK", "")       # Slack / Discord / generic webhook
-NOTIFY_EMAIL_TO = os.environ.get("NOTIFY_EMAIL_TO", "")
-NOTIFY_EMAIL_FROM = os.environ.get("NOTIFY_EMAIL_FROM", "")
-SMTP_HOST = os.environ.get("SMTP_HOST", "")
+NOTIFY_EMAIL_TO = os.environ.get("NOTIFY_EMAIL_TO", "notify@example.com")
+NOTIFY_EMAIL_FROM = os.environ.get("NOTIFY_EMAIL_FROM", "checker@example.com")
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.example.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASS = os.environ.get("SMTP_PASS", "")
@@ -313,12 +313,18 @@ def _email(subject: str, body: str):
     msg.attach(MIMEText(body, "plain"))
 
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.starttls()
-            if SMTP_USER:
-                server.login(SMTP_USER, SMTP_PASS)
-            server.sendmail(NOTIFY_EMAIL_FROM, NOTIFY_EMAIL_TO, msg.as_string())
-        log.info("Email notification sent to %s", NOTIFY_EMAIL_TO)
+        if SMTP_PORT == 465:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
+                if SMTP_USER:
+                    server.login(SMTP_USER, SMTP_PASS)
+                server.sendmail(NOTIFY_EMAIL_FROM, NOTIFY_EMAIL_TO, msg.as_string())
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+                server.starttls()
+                if SMTP_USER:
+                    server.login(SMTP_USER, SMTP_PASS)
+                server.sendmail(NOTIFY_EMAIL_FROM, NOTIFY_EMAIL_TO, msg.as_string())
+            log.info("Email notification sent to %s", NOTIFY_EMAIL_TO)
     except Exception as e:
         log.error("Email failed: %s", e)
 
