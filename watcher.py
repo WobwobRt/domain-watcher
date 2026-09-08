@@ -32,6 +32,73 @@ SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASS = os.environ.get("SMTP_PASS", "")
 
+# --- Rate limiting config -------------------------------------------------
+# Per-registry minimum seconds between whois requests. Keyed by TLD.
+# SIDN (.nl) enforces 1 request per 5 minutes; add other known-strict
+# registries here as you discover them.
+RATE_LIMIT_SECONDS = {
+    "nl": 300,
+}
+# Polite default gap for registries with no known hard limit.
+DEFAULT_RATE_LIMIT_SECONDS = int(os.environ.get("WHOIS_MIN_INTERVAL", "2"))
+
+# Phrases that indicate the registry throttled/denied the request rather
+# than returning real whois data. Checked case-insensitively.
+THROTTLE_INDICATORS = [
+    "try again later",
+    "rate limit",
+    "too many requests",
+    "quota exceeded",
+    "access denied",
+    "temporarily blocked",
+    "please try again",
+]
+
+RATE_STATE_FILE = Path("/data/rate_limit_state.json")
+_rate_state_cache = None  # lazy-loaded, kept in memory for the process lifetime
+
+
+def _load_rate_state() -> dict:
+    global _rate_state_cache
+    if _rate_state_cache is None:
+        if RATE_STATE_FILE.exists():
+            try:
+                _rate_state_cache = json.loads(RATE_STATE_FILE.read_text())
+            except Exception:
+                _rate_state_cache = {}
+        else:
+            _rate_state_cache = {}
+    return _rate_state_cache
+
+
+def _save_rate_state():
+    if _rate_state_cache is not None:
+        RATE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        RATE_STATE_FILE.write_text(json.dumps(_rate_state_cache))
+
+
+def _rate_limit_key(domain: str) -> str:
+    """Which registry bucket this domain's whois requests count against."""
+    return domain.rsplit(".", 1)[-1].lower()
+
+
+def _throttle(domain: str):
+    """Block until enough time has passed since the last whois request
+    to this domain's registry, then record the new request time."""
+    key = _rate_limit_key(domain)
+    min_interval = RATE_LIMIT_SECONDS.get(key, DEFAULT_RATE_LIMIT_SECONDS)
+    state = _load_rate_state()
+    last = state.get(key, 0)
+    elapsed = time.time() - last
+    if elapsed < min_interval:
+        wait = min_interval - elapsed
+        log.info(
+            "Rate limit: waiting %.0fs before next .%s whois request", wait, key
+        )
+        time.sleep(wait)
+    state[key] = time.time()
+    _save_rate_state()
+
 
 def whois(domain: str) -> str:
     """Run whois and return raw output."""
@@ -45,11 +112,20 @@ def whois(domain: str) -> str:
         cmd += ["-h", whois_server]
     cmd.append(domain)
 
+    _throttle(domain)
+
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=30
         )
-        return result.stdout
+        out = result.stdout
+        if out and any(ind in out.lower() for ind in THROTTLE_INDICATORS):
+            log.warning(
+                "Registry appears to have throttled the request for %s; "
+                "skipping this cycle rather than trusting the response", domain
+            )
+            return ""
+        return out
     except subprocess.TimeoutExpired:
         log.warning("whois timed out for %s", domain)
         return ""
