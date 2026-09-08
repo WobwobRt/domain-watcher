@@ -1,10 +1,10 @@
-FROM python:3.12-alpine
+FROM python:3.14-alpine
 
 RUN apk add --no-cache whois
 
 WORKDIR /app
-COPY checker.py .
+COPY watcher.py .
 
 VOLUME ["/data"]
 
-CMD ["python", "-u", "checker.py"]
+CMD ["python", "-u", "watcher.py"]
