@@ -20,7 +20,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 STATE_FILE = Path("/data/state.json")
-DOMAINS = [d.strip() for d in os.environ.get("DOMAINS", "hensen.nl").split(",") if d.strip()]
+DOMAINS = [d.strip() for d in os.environ.get("DOMAINS", "example.com").split(",") if d.strip()]
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))
 
 # Notification config
