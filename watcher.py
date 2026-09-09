@@ -8,13 +8,16 @@ import logging
 import time
 import re
 import datetime
+import threading
+import signal
+from collections import defaultdict
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
@@ -22,6 +25,26 @@ log = logging.getLogger(__name__)
 STATE_FILE = Path("/data/state.json")
 DOMAINS = [d.strip() for d in os.environ.get("DOMAINS", "example.com").split(",") if d.strip()]
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))
+
+# Delay between successive whois queries to the *same* TLD (rate-limit friendly).
+# Applied per TLD-worker thread; different TLDs run concurrently and are unaffected
+# by each other's throttling.
+TLD_THROTTLE = float(os.environ.get("TLD_THROTTLE_SECONDS", "2"))
+
+# Shared in-memory state + lock. All TLD worker threads read/write through this
+# lock so the state file never gets corrupted by concurrent writes, and no
+# worker ever clobbers another worker's domains when saving.
+STATE_LOCK = threading.Lock()
+
+# Set by the SIGTERM/SIGINT handler. Worker threads check this instead of
+# sleeping blindly, so a `docker stop` / `kill` shuts things down promptly
+# rather than waiting out whatever's left of the current interval.
+SHUTDOWN = threading.Event()
+
+
+def _handle_signal(signum, frame):
+    log.info("Received %s — shutting down…", signal.Signals(signum).name)
+    SHUTDOWN.set()
 
 # Notification config
 NOTIFY_WEBHOOK = os.environ.get("NOTIFY_WEBHOOK", "")       # Slack / Discord / generic webhook
@@ -31,73 +54,6 @@ SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.example.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASS = os.environ.get("SMTP_PASS", "")
-
-# --- Rate limiting config -------------------------------------------------
-# Per-registry minimum seconds between whois requests. Keyed by TLD.
-# SIDN (.nl) enforces 1 request per 5 minutes; add other known-strict
-# registries here as you discover them.
-RATE_LIMIT_SECONDS = {
-    "nl": 300,
-}
-# Polite default gap for registries with no known hard limit.
-DEFAULT_RATE_LIMIT_SECONDS = int(os.environ.get("WHOIS_MIN_INTERVAL", "2"))
-
-# Phrases that indicate the registry throttled/denied the request rather
-# than returning real whois data. Checked case-insensitively.
-THROTTLE_INDICATORS = [
-    "try again later",
-    "rate limit",
-    "too many requests",
-    "quota exceeded",
-    "access denied",
-    "temporarily blocked",
-    "please try again",
-]
-
-RATE_STATE_FILE = Path("/data/rate_limit_state.json")
-_rate_state_cache = None  # lazy-loaded, kept in memory for the process lifetime
-
-
-def _load_rate_state() -> dict:
-    global _rate_state_cache
-    if _rate_state_cache is None:
-        if RATE_STATE_FILE.exists():
-            try:
-                _rate_state_cache = json.loads(RATE_STATE_FILE.read_text())
-            except Exception:
-                _rate_state_cache = {}
-        else:
-            _rate_state_cache = {}
-    return _rate_state_cache
-
-
-def _save_rate_state():
-    if _rate_state_cache is not None:
-        RATE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        RATE_STATE_FILE.write_text(json.dumps(_rate_state_cache))
-
-
-def _rate_limit_key(domain: str) -> str:
-    """Which registry bucket this domain's whois requests count against."""
-    return domain.rsplit(".", 1)[-1].lower()
-
-
-def _throttle(domain: str):
-    """Block until enough time has passed since the last whois request
-    to this domain's registry, then record the new request time."""
-    key = _rate_limit_key(domain)
-    min_interval = RATE_LIMIT_SECONDS.get(key, DEFAULT_RATE_LIMIT_SECONDS)
-    state = _load_rate_state()
-    last = state.get(key, 0)
-    elapsed = time.time() - last
-    if elapsed < min_interval:
-        wait = min_interval - elapsed
-        log.info(
-            "Rate limit: waiting %.0fs before next .%s whois request", wait, key
-        )
-        time.sleep(wait)
-    state[key] = time.time()
-    _save_rate_state()
 
 
 def whois(domain: str) -> str:
@@ -112,20 +68,11 @@ def whois(domain: str) -> str:
         cmd += ["-h", whois_server]
     cmd.append(domain)
 
-    _throttle(domain)
-
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=30
         )
-        out = result.stdout
-        if out and any(ind in out.lower() for ind in THROTTLE_INDICATORS):
-            log.warning(
-                "Registry appears to have throttled the request for %s; "
-                "skipping this cycle rather than trusting the response", domain
-            )
-            return ""
-        return out
+        return result.stdout
     except subprocess.TimeoutExpired:
         log.warning("whois timed out for %s", domain)
         return ""
@@ -250,7 +197,12 @@ def load_state() -> dict:
 
 def save_state(state: dict):
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    # Write to a temp file and atomically swap it into place, so a crash or
+    # kill mid-write can never leave state.json truncated/corrupt (which
+    # would otherwise be silently discarded wholesale by load_state()).
+    tmp_path = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(state, indent=2))
+    os.replace(tmp_path, STATE_FILE)
 
 
 def _fmt_field(value) -> str:
@@ -405,28 +357,116 @@ def _email(subject: str, body: str):
         log.error("Email failed: %s", e)
 
 
-def check_domain(domain: str, state: dict):
+def check_domain(domain: str, prev: dict):
+    """
+    Run whois for a single domain and compare against its previous state.
+
+    Deliberately takes/returns plain dicts rather than touching shared state
+    itself — the slow part (the actual whois network call) happens with no
+    lock held, so it can't block other TLD worker threads. Returns the new
+    state entry to store for this domain, or None if the check failed and
+    nothing should be updated.
+    """
     log.info("Checking %s …", domain)
     raw = whois(domain)
     if not raw:
         log.warning("Empty whois response for %s, skipping", domain)
-        return
+        return None
 
     parsed = parse_status(raw)
     fp = fingerprint(parsed)
-    prev = state.get(domain, {})
+    now = datetime.datetime.now(datetime.UTC).isoformat() + "Z"
 
     if prev.get("fingerprint") != fp:
         notify(domain, prev, parsed)
-        state[domain] = {
+        return {
             "fingerprint": fp,
             "parsed": parsed,
-            "last_changed": datetime.datetime.now(datetime.UTC).isoformat() + "Z",
+            "last_changed": now,
+            "last_checked": now,
         }
     else:
         log.info("No change for %s (status: %s)", domain, parsed.get("status", "?"))
+        entry = dict(prev)
+        entry["last_checked"] = now
+        return entry
 
-    state[domain]["last_checked"] = datetime.datetime.now(datetime.UTC).isoformat() + "Z"
+
+def group_by_tld(domains):
+    groups = defaultdict(list)
+    for d in domains:
+        tld = d.rsplit(".", 1)[-1].lower()
+        groups[tld].append(d)
+    return groups
+
+
+def tld_worker(tld: str, domains: list, state: dict):
+    """
+    Owns the check/sleep cycle for a single TLD. Runs forever in its own
+    thread. Its throttle delay only affects the domains in *this* TLD group —
+    it never adds to any other TLD's schedule, so N TLDs no longer means the
+    effective interval grows to roughly N * CHECK_INTERVAL.
+    """
+    log.info(
+        "[.%s] worker starting — %d domain(s), throttle %ss, interval %ss",
+        tld, len(domains), TLD_THROTTLE, CHECK_INTERVAL,
+    )
+    while not SHUTDOWN.is_set():
+        cycle_start = time.monotonic()
+        try:
+            for i, domain in enumerate(domains):
+                if SHUTDOWN.is_set():
+                    break
+
+                with STATE_LOCK:
+                    prev = state.get(domain, {})
+                try:
+                    new_entry = check_domain(domain, prev)
+                except Exception as e:
+                    log.error("Error checking %s: %s", domain, e)
+                    new_entry = None
+
+                if new_entry is not None:
+                    with STATE_LOCK:
+                        state[domain] = new_entry
+                        save_state(state)
+
+                # Only throttle between domains *within* this TLD group.
+                # Waiting on the event (rather than time.sleep) lets a
+                # shutdown signal interrupt the throttle immediately.
+                if i < len(domains) - 1:
+                    SHUTDOWN.wait(timeout=TLD_THROTTLE)
+        except Exception:
+            # Catch-all so an unexpected failure (e.g. disk full during
+            # save_state, or a bug in a new TLD parser) can't silently kill
+            # this thread outright. The main-thread supervisor will restart
+            # it too if it ever does exit, but we'd rather just keep this
+            # thread alive and try again next cycle.
+            log.exception("[.%s] worker hit an unexpected error this cycle", tld)
+
+        if SHUTDOWN.is_set():
+            break
+
+        elapsed = time.monotonic() - cycle_start
+        sleep_time = max(0.0, CHECK_INTERVAL - elapsed)
+        log.info(
+            "[.%s] cycle finished in %.1fs — next check in %.0fs",
+            tld, elapsed, sleep_time,
+        )
+        SHUTDOWN.wait(timeout=sleep_time)
+
+    log.info("[.%s] worker stopping", tld)
+
+
+def spawn_worker(tld: str, domains: list, state: dict) -> threading.Thread:
+    t = threading.Thread(
+        target=tld_worker,
+        args=(tld, domains, state),
+        name=f"tld-{tld}",
+        daemon=True,
+    )
+    t.start()
+    return t
 
 
 def main():
@@ -434,18 +474,36 @@ def main():
         log.error("No domains configured. Set the DOMAINS env var (comma-separated).")
         return
 
-    log.info("Starting domain-watcher — domains: %s, interval: %ss", DOMAINS, CHECK_INTERVAL)
+    # SIGTERM is what Docker/Kubernetes send on stop/restart; SIGINT covers
+    # Ctrl+C during local runs. Both trigger the same graceful shutdown path.
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
 
-    while True:
-        state = load_state()
-        for domain in DOMAINS:
-            try:
-                check_domain(domain, state)
-            except Exception as e:
-                log.error("Error checking %s: %s", domain, e)
-        save_state(state)
-        log.info("Next check in %s seconds", CHECK_INTERVAL)
-        time.sleep(CHECK_INTERVAL)
+    state = load_state()
+    groups = group_by_tld(DOMAINS)
+
+    log.info(
+        "Starting domain-watcher — %d TLD group(s) across %d domain(s), interval: %ss",
+        len(groups), len(DOMAINS), CHECK_INTERVAL,
+    )
+
+    workers = {tld: spawn_worker(tld, domains, state) for tld, domains in groups.items()}
+
+    # Supervisor loop: as long as we haven't been asked to shut down, watch
+    # for any worker thread that has died unexpectedly and restart it, so a
+    # single crashed TLD worker doesn't quietly stop monitoring that TLD for
+    # the rest of the process's life.
+    while not SHUTDOWN.is_set():
+        for tld, domains in groups.items():
+            if not workers[tld].is_alive() and not SHUTDOWN.is_set():
+                log.error("[.%s] worker exited unexpectedly — restarting", tld)
+                workers[tld] = spawn_worker(tld, domains, state)
+        SHUTDOWN.wait(timeout=1.0)
+
+    log.info("Waiting for workers to finish their current cycle…")
+    for t in workers.values():
+        t.join(timeout=CHECK_INTERVAL + 30)
+    log.info("Domain-watcher stopped.")
 
 
 if __name__ == "__main__":
